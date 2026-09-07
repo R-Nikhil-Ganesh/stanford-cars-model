@@ -2,3 +2,6 @@
 /stanford-cars
 /tf-env
 /compcars_cctv/extracted
+code/anno_test.csv
+code/anno_train.csv
+/Vehicle-Make-v1
