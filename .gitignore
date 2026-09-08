@@ -6,3 +6,8 @@ code/anno_test.csv
 code/anno_train.csv
 /Vehicle-Make-v1
 /archive
+*.keras
+*.h5
+*.csv
+test_predictions.txt
+*__pycache__
