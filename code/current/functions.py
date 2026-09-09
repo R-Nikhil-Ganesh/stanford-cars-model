@@ -12,10 +12,16 @@ from tensorflow.keras.applications.efficientnet import preprocess_input
 from IPython.display import display
 
 # --- 1. Model & Metadata Loader ---
-def load_model_and_metadata(model_path="showroom_bbox_b0.keras", data_dir="../../compcars_cctv/extracted/data_extracted/data"):
+def load_model_and_metadata(model_path, data_dir):
     """
     Loads the trained Keras model and extracts CompCars 431 benchmark metadata and label dictionaries.
     """
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found at '{model_path}'")
+
+    if not os.path.exists(data_dir):
+        raise FileNotFoundError(f"Data directory not found at '{data_dir}'")
+
     print(f"Loading model from '{model_path}'...")
     model = load_model(model_path)
     
@@ -136,28 +142,31 @@ def prepare_test_dataframe(data_dir, test_lines, meta_dict):
 
 
 # --- 4. Class-wise Accuracy Computation ---
-def compute_classwise_accuracy(model, test_df, meta_dict, csv_path="compcars_showroom_classwise_accuracy.csv", batch_size=32, target_size=(224, 224)):
+def compute_classwise_accuracy(model, test_df, meta_dict, csv_path="compcars_showroom_classwise_accuracy.csv", batch_size=64, target_size=(224, 224), force_recompute=False, data_dir=None):
     """
     Loads cached class-wise accuracy metrics from CSV or executes model.predict() on test set.
     """
-    img_dir = meta_dict.get("img_dir", "../../compcars_cctv/extracted/data_extracted/data/image")
-    data_dir = meta_dict.get("data_dir", "../../compcars_cctv/extracted/data_extracted/data")
-    num_classes = meta_dict["num_classes"]
-    label_to_model = meta_dict["label_to_model"]
-    class_names = meta_dict["class_names"]
+    if data_dir is None and meta_dict is not None:
+        data_dir = meta_dict.get("data_dir")
+    
+    img_dir = meta_dict.get("img_dir") if meta_dict and "img_dir" in meta_dict else (os.path.join(data_dir, "image") if data_dir else None)
+    num_classes = meta_dict["num_classes"] if meta_dict and "num_classes" in meta_dict else test_df["label"].nunique()
+    label_to_model = meta_dict.get("label_to_model") if meta_dict else None
+    class_names = meta_dict.get("class_names") if meta_dict else None
 
-    if os.path.exists(csv_path):
+    if os.path.exists(csv_path) and not force_recompute:
         print(f"Loading precomputed class-wise accuracy metrics from '{csv_path}'...")
         class_acc_df = pd.read_csv(csv_path)
         # Dynamically re-anchor paths using current img_dir
-        class_acc_df["folder_path"] = class_acc_df.apply(
-            lambda r: os.path.join(img_dir, f"{int(r['make_id'])}/{int(r['model_id'])}"),
-            axis=1
-        )
-        if "sample_image" in class_acc_df.columns:
-            class_acc_df["sample_image"] = class_acc_df["sample_image"].apply(
-                lambda p: os.path.join(data_dir, p.split("data_extracted/data/")[-1]) if "data_extracted/data/" in str(p) else p
+        if img_dir is not None:
+            class_acc_df["folder_path"] = class_acc_df.apply(
+                lambda r: os.path.join(img_dir, f"{int(r['make_id'])}/{int(r['model_id'])}"),
+                axis=1
             )
+            if "sample_image" in class_acc_df.columns:
+                class_acc_df["sample_image"] = class_acc_df["sample_image"].apply(
+                    lambda p: os.path.join(img_dir, str(p).split("/image/")[-1]) if "/image/" in str(p) else p
+                )
     else:
         print("Generating test set predictions with model.predict()...")
         test_generator = BBoxDataGenerator(test_df, batch_size=batch_size, target_size=target_size, num_classes=num_classes)
@@ -281,9 +290,13 @@ def plot_accuracy_spectrum(class_acc_df, figsize=(18, 9.5), dpi=100):
     ax0.axhline(mean_acc, color="#3a0ca3", linestyle=":", linewidth=1.6)
     ax0.axhline(median_acc, color="#7209b7", linestyle="-.", linewidth=1.6)
 
-    ax0.text(n + 3, 50, "50% Threshold\n(102 models < 50%)", va="center", ha="left", color="#d90429", fontsize=8.5, fontweight="bold")
-    ax0.text(n + 3, 70, "70% Threshold\n(263 models < 70%)", va="center", ha="left", color="#f77f00", fontsize=8.5, fontweight="bold")
-    ax0.text(n + 3, 90, "90% Threshold\n(40 models ≥ 90%)", va="center", ha="left", color="#1b9aaa", fontsize=8.5, fontweight="bold")
+    cnt_50 = int((sorted_df["accuracy_pct"] < 50.0).sum())
+    cnt_70 = int((sorted_df["accuracy_pct"] < 70.0).sum())
+    cnt_90 = int((sorted_df["accuracy_pct"] >= 90.0).sum())
+
+    ax0.text(n + 3, 50, f"50% Threshold\n({cnt_50} models < 50%)", va="center", ha="left", color="#d90429", fontsize=8.5, fontweight="bold")
+    ax0.text(n + 3, 70, f"70% Threshold\n({cnt_70} models < 70%)", va="center", ha="left", color="#f77f00", fontsize=8.5, fontweight="bold")
+    ax0.text(n + 3, 90, f"90% Threshold\n({cnt_90} models ≥ 90%)", va="center", ha="left", color="#1b9aaa", fontsize=8.5, fontweight="bold")
 
     lowest_name = sorted_df.iloc[0]["class_name"].strip()
     lowest_acc = sorted_df.iloc[0]["accuracy_pct"]
@@ -298,34 +311,45 @@ def plot_accuracy_spectrum(class_acc_df, figsize=(18, 9.5), dpi=100):
         m_idx = magotan_sub.index[0] + 1
         m_acc = magotan_sub["accuracy_pct"].values[0]
         ax0.annotate(f"#{m_idx}: Magotan ({m_acc}%)",
-                     xy=(m_idx, m_acc), xytext=(m_idx + 22, m_acc + 15),
-                     arrowprops=dict(arrowstyle="->", color="#d90429", lw=1.5),
-                     fontsize=9, fontweight="bold", color="#d90429",
-                     bbox=dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor="#d90429", alpha=0.9))
+                 xy=(m_idx, m_acc), xytext=(m_idx + 22, m_acc + 15),
+                 arrowprops=dict(arrowstyle="->", color="#d90429", lw=1.5),
+                 fontsize=9, fontweight="bold", color="#d90429",
+                 bbox=dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor="#d90429", alpha=0.9))
 
     highest_name = sorted_df.iloc[-1]["class_name"].strip()
     highest_acc = sorted_df.iloc[-1]["accuracy_pct"]
-    ax0.annotate(f"#431: {highest_name} ({highest_acc}%)",
+    ax0.annotate(f"#{n}: {highest_name} ({highest_acc}%)",
                  xy=(n, highest_acc), xytext=(n - 120, 95),
                  arrowprops=dict(arrowstyle="->", color="#1b9aaa", lw=1.5),
                  fontsize=9, fontweight="bold", color="#1b9aaa",
                  bbox=dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor="#1b9aaa", alpha=0.9))
 
-    ticks = [1, 50, 100, 150, 200, 250, 300, 350, 400, 431]
-    tick_labels = ["#1\n(Lowest)", "#50", "#100", "#150", "#200\n(~65%)", "#250", "#300", "#350", "#400", "#431\n(Highest)"]
+    acc_200 = round(sorted_df.iloc[199]["accuracy_pct"]) if len(sorted_df) > 199 else 65
+    ticks = [1, 50, 100, 150, 200, 250, 300, 350, 400, n]
+    tick_labels = ["#1\n(Lowest)", "#50", "#100", "#150", f"#200\n(~{acc_200}%)", "#250", "#300", "#350", "#400", f"#{n}\n(Highest)"]
     ax0.set_xticks(ticks)
     ax0.set_xticklabels(tick_labels, fontsize=9)
     ax0.set_xlim(-5, n + 48)
     ax0.set_ylim(0, 105)
     ax0.set_ylabel("Test Accuracy (%)", fontsize=11, fontweight="bold")
-    ax0.set_title("All 431 Car Models Sorted by Test Accuracy (Lowest → Highest)", fontsize=12.5, fontweight="bold", pad=10)
+    ax0.set_title(f"All {n} Car Models Sorted by Test Accuracy (Lowest → Highest)", fontsize=12.5, fontweight="bold", pad=10)
     ax0.grid(axis="y", alpha=0.3, linestyle="--")
 
+    cnt_crit = int((sorted_df["accuracy_pct"] < 50.0).sum())
+    cnt_sub = int(((sorted_df["accuracy_pct"] >= 50.0) & (sorted_df["accuracy_pct"] < 70.0)).sum())
+    cnt_tgt = int(((sorted_df["accuracy_pct"] >= 70.0) & (sorted_df["accuracy_pct"] < 90.0)).sum())
+    cnt_high = int((sorted_df["accuracy_pct"] >= 90.0).sum())
+
+    pct_crit = (cnt_crit / n * 100.0) if n > 0 else 0.0
+    pct_sub = (cnt_sub / n * 100.0) if n > 0 else 0.0
+    pct_tgt = (cnt_tgt / n * 100.0) if n > 0 else 0.0
+    pct_high = (cnt_high / n * 100.0) if n > 0 else 0.0
+
     legend_elements = [
-        Patch(facecolor="#d90429", label="< 50% Critical (102 models, 23.7%)"),
-        Patch(facecolor="#f77f00", label="50% - 70% Sub-baseline (161 models, 37.4%)"),
-        Patch(facecolor="#06d6a0", label="70% - 90% Target (128 models, 29.7%)"),
-        Patch(facecolor="#1b9aaa", label="≥ 90% High Precision (40 models, 9.3%)"),
+        Patch(facecolor="#d90429", label=f"< 50% Critical ({cnt_crit} models, {pct_crit:.1f}%)"),
+        Patch(facecolor="#f77f00", label=f"50% - 70% Sub-baseline ({cnt_sub} models, {pct_sub:.1f}%)"),
+        Patch(facecolor="#06d6a0", label=f"70% - 90% Target ({cnt_tgt} models, {pct_tgt:.1f}%)"),
+        Patch(facecolor="#1b9aaa", label=f"≥ 90% High Precision ({cnt_high} models, {pct_high:.1f}%)"),
         plt.Line2D([0], [0], color="#3a0ca3", linestyle=":", linewidth=1.6, label=f"Macro Mean ({mean_acc:.1f}%)"),
         plt.Line2D([0], [0], color="#7209b7", linestyle="-.", linewidth=1.6, label=f"Median ({median_acc:.1f}%)"),
     ]
@@ -428,11 +452,14 @@ def compute_makewise_accuracy(class_acc_df, csv_path="compcars_showroom_makewise
     tier_90 = make_acc_df[(make_acc_df["accuracy_pct"] >= 70.0) & (make_acc_df["accuracy_pct"] < 90.0)]
     tier_top = make_acc_df[make_acc_df["accuracy_pct"] >= 90.0]
 
+    def get_example_brands(df_tier, max_b=4):
+        return ", ".join(df_tier["make_name"].head(max_b)) if not df_tier.empty else "None"
+
     tier_summary = pd.DataFrame([
-        {"Tier": "< 50% (Critical)", "Brand Count": len(tier_50), "Share": f"{len(tier_50)/n_makes*100:.1f}%", "Example Brands": ", ".join(tier_50["make_name"].head(3))},
-        {"Tier": "50% - 70% (Sub-baseline)", "Brand Count": len(tier_70), "Share": f"{len(tier_70)/n_makes*100:.1f}%", "Example Brands": "Volkswagen, Audi, BMW, Toyota, Peugeot"},
-        {"Tier": "70% - 90% (Target Range)", "Brand Count": len(tier_90), "Share": f"{len(tier_90)/n_makes*100:.1f}%", "Example Brands": "Volvo, Buick, Suzuki, Jeep, Porsche"},
-        {"Tier": "≥ 90% (High Precision)", "Brand Count": len(tier_top), "Share": f"{len(tier_top)/n_makes*100:.1f}%", "Example Brands": ", ".join(tier_top["make_name"].head(3))}
+        {"Tier": "< 50% (Critical)", "Brand Count": len(tier_50), "Share": f"{len(tier_50)/n_makes*100:.1f}%", "Example Brands": get_example_brands(tier_50, 3)},
+        {"Tier": "50% - 70% (Sub-baseline)", "Brand Count": len(tier_70), "Share": f"{len(tier_70)/n_makes*100:.1f}%", "Example Brands": get_example_brands(tier_70, 5)},
+        {"Tier": "70% - 90% (Target Range)", "Brand Count": len(tier_90), "Share": f"{len(tier_90)/n_makes*100:.1f}%", "Example Brands": get_example_brands(tier_90, 5)},
+        {"Tier": "≥ 90% (High Precision)", "Brand Count": len(tier_top), "Share": f"{len(tier_top)/n_makes*100:.1f}%", "Example Brands": get_example_brands(tier_top, 5)}
     ])
 
     return make_acc_df, tier_summary
@@ -557,7 +584,7 @@ def analyze_cctv_overlap(class_acc_df, mappings_file="compcars_431_model_mapping
 
 
 # --- 10. Interactive Filesystem Image Inspection with Bounding Boxes ---
-def view_model_images(class_acc_df, query, max_images=None, cols=4, show_bbox=True, year=None, img_dir=None):
+def view_model_images(class_acc_df, query, max_images=None, cols=4, show_bbox=True, year=None, img_dir=None, data_dir=None):
     """
     Look up any car model and display its actual images loaded directly from the filesystem folder,
     with official bounding box annotations overlaid in a clean grid layout.
@@ -582,15 +609,21 @@ def view_model_images(class_acc_df, query, max_images=None, cols=4, show_bbox=Tr
     
     row = match.iloc[0]
     
+    if img_dir is None and data_dir is not None:
+        img_dir = os.path.join(data_dir, "image")
+
     # Dynamically resolve folder path
-    if img_dir is not None and os.path.exists(img_dir):
-        folder = os.path.join(img_dir, f"{int(row['make_id'])}/{int(row['model_id'])}")
-    elif "IMG_DIR" in globals() and os.path.exists(IMG_DIR):
-        folder = os.path.join(IMG_DIR, f"{int(row['make_id'])}/{int(row['model_id'])}")
-    else:
-        folder = row["folder_path"]
-        if not os.path.exists(folder):
-            folder = os.path.join("../../compcars_cctv/extracted/data_extracted/data/image", f"{int(row['make_id'])}/{int(row['model_id'])}")
+    folder = None
+    if img_dir is not None:
+        cand = os.path.join(img_dir, f"{int(row['make_id'])}/{int(row['model_id'])}")
+        if os.path.exists(cand):
+            folder = cand
+    
+    if folder is None and "folder_path" in row and os.path.exists(str(row["folder_path"])):
+        folder = str(row["folder_path"])
+
+    if folder is None:
+        folder = os.path.join(img_dir, f"{int(row['make_id'])}/{int(row['model_id'])}") if img_dir else str(row.get("folder_path", ""))
 
     print(f"Model: {row['class_name']} (model_id: {row['model_id']}, make_id: {row.get('make_id', 'N/A')})")
     print(f"Accuracy: {row['accuracy_pct']}% ({row['correct_samples']}/{row['total_samples']} correct)")

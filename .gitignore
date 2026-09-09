@@ -11,3 +11,4 @@ code/anno_train.csv
 *.csv
 test_predictions.txt
 *__pycache__
+*env
