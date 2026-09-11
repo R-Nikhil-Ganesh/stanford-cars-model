@@ -6,6 +6,7 @@ import matplotlib.patches as patches
 from matplotlib.patches import Patch, Rectangle
 from PIL import Image
 from scipy.io import loadmat
+from concurrent.futures import ThreadPoolExecutor
 from tensorflow.keras.models import load_model
 from tensorflow.keras.utils import Sequence
 from tensorflow.keras.applications.efficientnet import preprocess_input
@@ -65,35 +66,46 @@ def load_model_and_metadata(model_path, data_dir):
     return model, meta_dict
 
 
+def _load_crop_and_resize(args):
+    file_path, box, target_size = args
+    with Image.open(file_path) as img:
+        img = img.convert("RGB")
+        cropped = img.crop(box)
+        resized = cropped.resize(target_size, Image.BILINEAR)
+        return np.array(resized, dtype=np.float32)
+
+
 # --- 2. Bounding Box Data Generator ---
 class BBoxDataGenerator(Sequence):
     """
     Custom Keras Sequence Generator that crops each car image according to its
-    annotated bounding box coordinates [x1, y1, x2, y2] before resizing
-    and feeding into the model for inference.
+    annotated bounding box coordinates [x1, y1, x2, y2] using high-throughput
+    multithreading before resizing and feeding into the model for inference.
     """
-    def __init__(self, df, batch_size=32, target_size=(224, 224), num_classes=431):
+    def __init__(self, df, batch_size=64, target_size=(224, 224), num_classes=431, workers=16, **kwargs):
+        super().__init__(**kwargs)
         self.df = df.reset_index(drop=True)
         self.batch_size = batch_size
         self.target_size = target_size
         self.num_classes = num_classes
+        self.workers = workers
+        self.pool = ThreadPoolExecutor(max_workers=workers)
 
     def __len__(self):
         return int(np.ceil(len(self.df) / self.batch_size))
 
     def __getitem__(self, idx):
         batch_df = self.df.iloc[idx * self.batch_size : (idx + 1) * self.batch_size]
-        batch_x = []
-        for _, row in batch_df.iterrows():
-            with Image.open(row["file_path"]) as img:
-                img = img.convert("RGB")
-                box = (row["bbox_x1"], row["bbox_y1"], row["bbox_x2"], row["bbox_y2"])
-                cropped = img.crop(box)
-                resized = cropped.resize(self.target_size, Image.BILINEAR)
-                batch_x.append(np.array(resized, dtype=np.float32))
-        
+        items = [
+            (row["file_path"], (row["bbox_x1"], row["bbox_y1"], row["bbox_x2"], row["bbox_y2"]), self.target_size)
+            for _, row in batch_df.iterrows()
+        ]
+        batch_x = list(self.pool.map(_load_crop_and_resize, items))
         batch_x = preprocess_input(np.array(batch_x))
         return batch_x
+
+    def close(self):
+        self.pool.shutdown(wait=False)
 
 
 # --- 3. Test DataFrame Preparation ---
@@ -142,7 +154,7 @@ def prepare_test_dataframe(data_dir, test_lines, meta_dict):
 
 
 # --- 4. Class-wise Accuracy Computation ---
-def compute_classwise_accuracy(model, test_df, meta_dict, csv_path="compcars_showroom_classwise_accuracy.csv", batch_size=64, target_size=(224, 224), force_recompute=False, data_dir=None):
+def compute_classwise_accuracy(model, test_df, meta_dict, csv_path="compcars_showroom_classwise_accuracy.csv", batch_size=64, target_size=(224, 224), force_recompute=False, data_dir=None, workers=16):
     """
     Loads cached class-wise accuracy metrics from CSV or executes model.predict() on test set.
     """
@@ -169,8 +181,9 @@ def compute_classwise_accuracy(model, test_df, meta_dict, csv_path="compcars_sho
                 )
     else:
         print("Generating test set predictions with model.predict()...")
-        test_generator = BBoxDataGenerator(test_df, batch_size=batch_size, target_size=target_size, num_classes=num_classes)
-        test_pred_probs = model.predict(test_generator)
+        test_generator = BBoxDataGenerator(test_df, batch_size=batch_size, target_size=target_size, num_classes=num_classes, workers=workers)
+        test_pred_probs = model.predict(test_generator, verbose=1)
+        test_generator.close()
         y_pred = np.argmax(test_pred_probs, axis=1)
         y_true = np.array(test_df["label"].values, dtype=int)
 
