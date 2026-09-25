@@ -475,13 +475,22 @@ class GradCAMAnalyzer:
         img_array = np.array(img_resized, dtype=np.float32)
         img_batch = np.expand_dims(img_array, axis=0)
 
-        with tf.GradientTape() as tape:
-            conv_outputs, predictions = self.grad_model(img_batch)
-            if target_class_idx is None:
-                target_class_idx = tf.argmax(predictions[0])
-            loss = predictions[:, target_class_idx]
-
-        grads = tape.gradient(loss, conv_outputs)
+        try:
+            with tf.GradientTape() as tape:
+                conv_outputs, predictions = self.grad_model(img_batch)
+                if target_class_idx is None:
+                    target_class_idx = tf.argmax(predictions[0])
+                loss = predictions[:, target_class_idx]
+            grads = tape.gradient(loss, conv_outputs)
+        except Exception:
+            # Fallback to CPU if GPU memory is constrained by concurrent jobs
+            with tf.device("/CPU:0"):
+                with tf.GradientTape() as tape:
+                    conv_outputs, predictions = self.grad_model(img_batch)
+                    if target_class_idx is None:
+                        target_class_idx = tf.argmax(predictions[0])
+                    loss = predictions[:, target_class_idx]
+                grads = tape.gradient(loss, conv_outputs)
         pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
         conv_outputs = conv_outputs[0]
         heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)

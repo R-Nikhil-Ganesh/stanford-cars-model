@@ -149,6 +149,8 @@ def load_test_evaluation(
     # 1. Load test manifest
     test_df_full = pd.read_csv(s_dir / "test.csv")
     test_df = test_df_full[test_df_full["make"].isin(CLASS_NAMES)].copy().reset_index(drop=True)
+    if "model" not in test_df.columns:
+        test_df["model"] = test_df["source"] if "source" in test_df.columns else "Standard"
     test_df["target_idx"] = test_df["make"].map(CLASS_TO_IDX)
     print(f"[Test Set] Total images: {len(test_df):,} spanning {test_df['make'].nunique()} makes")
 
@@ -476,13 +478,22 @@ class GradCAMAnalyzer:
         img_array = np.array(img_resized, dtype=np.float32)
         img_batch = np.expand_dims(img_array, axis=0)
 
-        with tf.GradientTape() as tape:
-            conv_outputs, predictions = self.grad_model(img_batch)
-            if target_class_idx is None:
-                target_class_idx = tf.argmax(predictions[0])
-            loss = predictions[:, target_class_idx]
-
-        grads = tape.gradient(loss, conv_outputs)
+        try:
+            with tf.GradientTape() as tape:
+                conv_outputs, predictions = self.grad_model(img_batch)
+                if target_class_idx is None:
+                    target_class_idx = tf.argmax(predictions[0])
+                loss = predictions[:, target_class_idx]
+            grads = tape.gradient(loss, conv_outputs)
+        except Exception:
+            # Fallback to CPU if GPU memory is constrained by concurrent jobs
+            with tf.device("/CPU:0"):
+                with tf.GradientTape() as tape:
+                    conv_outputs, predictions = self.grad_model(img_batch)
+                    if target_class_idx is None:
+                        target_class_idx = tf.argmax(predictions[0])
+                    loss = predictions[:, target_class_idx]
+                grads = tape.gradient(loss, conv_outputs)
         pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
         conv_outputs = conv_outputs[0]
         heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
@@ -673,13 +684,17 @@ class GradCAMAnalyzer:
                 model_matches = make_matches[make_matches["model"].astype(str).str.lower().str.contains(clean_model, regex=False)]
             
             if len(model_matches) == 0:
+                # Also check in image_path
+                model_matches = make_matches[make_matches["image_path"].astype(str).str.lower().str.contains(clean_model, regex=False)]
+
+            if len(model_matches) == 0:
                 avail_models = sorted(make_matches["model"].dropna().unique())
-                raise ValueError(
-                    f"Model '{model_name}' not found for make '{matched_make}'.\n"
-                    f"Available models for {matched_make} ({len(avail_models)}): {avail_models}"
-                )
-            matched_model = model_matches["model"].iloc[0]
-            subset = model_matches
+                print(f"[Notice] Specific model tag '{model_name}' not indexed for {matched_make} (available sources: {avail_models}). Visualizing representative '{matched_make}' vehicles.")
+                matched_model = f"All ({matched_make})"
+                subset = make_matches
+            else:
+                matched_model = model_matches["model"].iloc[0]
+                subset = model_matches
         else:
             matched_model = "All Models"
             subset = make_matches
@@ -792,6 +807,8 @@ class GradCAMAnalyzer:
 
 def list_available_models(test_df: pd.DataFrame, make: Optional[str] = None) -> List[str]:
     """Lists all vehicle models available in the test dataset for a given make."""
+    if "model" not in test_df.columns:
+        test_df["model"] = test_df["source"] if "source" in test_df.columns else "Standard"
     if make is not None:
         sub = test_df[test_df["make"].str.lower() == make.strip().lower()]
         if len(sub) == 0:

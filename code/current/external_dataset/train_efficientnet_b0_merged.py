@@ -312,6 +312,15 @@ def main():
         print(f"\n[Saved] Final model: {final_model_path}")
         print(f"[Saved] Best model:  {best_model_path}")
 
+        try:
+            best_onnx = models_dir / "efficientnet_b0_best.onnx"
+            final_onnx = models_dir / "efficientnet_b0_final.onnx"
+            export_model_to_onnx(model, final_onnx, img_size=args.img_size, opset=args.opset)
+            best_loaded = models.load_model(str(best_model_path))
+            export_model_to_onnx(best_loaded, best_onnx, img_size=args.img_size, opset=args.opset)
+        except Exception as e:
+            print(f"[Warning] Automatic ONNX export failed: {e}")
+
         plot_training_curves(reports_dir / "training_history.csv", plots_dir)
 
     # Evaluation
